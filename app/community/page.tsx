@@ -414,7 +414,7 @@ export default function Community() {
         author_id: user.id,
         body: trimmed,
       })
-      .select("id,community_id,author_id,body,created_at")
+      .select("id,community_id,author_id,body,created_at,expires_at")
       .single();
 
     setSendingChat(false);
