@@ -41,6 +41,15 @@ type ChatMessage = {
   author_id: string;
   body: string;
   created_at: string;
+  expires_at: string;
+};
+
+type DirectMessage = {
+  id: string;
+  sender_id: string;
+  recipient_id: string;
+  body: string;
+  created_at: string;
 };
 
 const avatarColors = [
@@ -60,6 +69,10 @@ export default function Community() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatDraft, setChatDraft] = useState("");
   const [sendingChat, setSendingChat] = useState(false);
+  const [dmMessages, setDmMessages] = useState<DirectMessage[]>([]);
+  const [activeDmProfile, setActiveDmProfile] = useState<Profile | null>(null);
+  const [dmDraft, setDmDraft] = useState("");
+  const [sendingDm, setSendingDm] = useState(false);
   const [profiles, setProfiles] = useState<Record<string, Profile>>({});
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -75,11 +88,13 @@ export default function Community() {
   const [status, setStatus] = useState("Loading…");
   const [communityId, setCommunityId] = useState<string | null>(null);
   const client = useMemo(() => supabase(), []);
+  const activeDmUserId = activeDmProfile?.id || null;
 
   useEffect(() => {
     let postChannel: ReturnType<typeof client.channel> | null = null;
     let commentChannel: ReturnType<typeof client.channel> | null = null;
     let chatChannel: ReturnType<typeof client.channel> | null = null;
+    let dmChannel: ReturnType<typeof client.channel> | null = null;
 
     async function start() {
       const currentZip = localStorage.getItem("anytown_zip") || "";
@@ -158,8 +173,9 @@ export default function Community() {
 
       const { data: loadedChat } = await client
         .from("chat_messages")
-        .select("id,community_id,author_id,body,created_at")
+        .select("id,community_id,author_id,body,created_at,expires_at")
         .eq("community_id", community.id)
+        .gt("expires_at", new Date().toISOString())
         .order("created_at", { ascending: true })
         .limit(100);
 
@@ -234,6 +250,8 @@ export default function Community() {
           },
           async (event) => {
             const incoming = event.new as ChatMessage;
+            if (new Date(incoming.expires_at).getTime() <= Date.now()) return;
+
             setChatMessages((current) =>
               current.some((message) => message.id === incoming.id)
                 ? current
@@ -254,6 +272,41 @@ export default function Community() {
                 }));
               }
             }
+          },
+        )
+        .subscribe((channelStatus, channelError) => {
+          if (channelStatus === "CHANNEL_ERROR" || channelStatus === "TIMED_OUT") {
+            setStatus("Town chat connection failed. Try refreshing.");
+            console.error("Town chat realtime error", channelError);
+          }
+        });
+
+      dmChannel = client
+        .channel("live-direct-messages")
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "direct_messages",
+          },
+          (event) => {
+            const incoming = event.new as DirectMessage;
+            setDmMessages((current) => {
+              if (
+                !activeDmUserId ||
+                !(
+                  (incoming.sender_id === user.id && incoming.recipient_id === activeDmUserId) ||
+                  (incoming.sender_id === activeDmUserId && incoming.recipient_id === user.id)
+                )
+              ) {
+                return current;
+              }
+
+              return current.some((message) => message.id === incoming.id)
+                ? current
+                : [...current, incoming];
+            });
           },
         )
         .subscribe();
@@ -280,6 +333,7 @@ export default function Community() {
       if (postChannel) client.removeChannel(postChannel);
       if (commentChannel) client.removeChannel(commentChannel);
       if (chatChannel) client.removeChannel(chatChannel);
+      if (dmChannel) client.removeChannel(dmChannel);
     };
   }, [client]);
 
@@ -373,6 +427,75 @@ export default function Community() {
     );
     setChatDraft("");
     setStatus("Live");
+  }
+
+  async function openDirectMessage(authorId: string) {
+    if (!profile?.id || authorId === profile.id) return;
+
+    const author = profiles[authorId];
+    if (!author) {
+      const { data } = await client
+        .from("profiles")
+        .select("id,display_name,avatar_color,gender")
+        .eq("id", authorId)
+        .maybeSingle();
+
+      if (!data) return;
+      setProfiles((current) => ({ ...current, [authorId]: data as Profile }));
+      setActiveDmProfile(data as Profile);
+    } else {
+      setActiveDmProfile(author);
+    }
+
+    const { data: messages, error } = await client
+      .from("direct_messages")
+      .select("id,sender_id,recipient_id,body,created_at")
+      .or(
+        "and(sender_id.eq." + profile.id + ",recipient_id.eq." + authorId + "),and(sender_id.eq." + authorId + ",recipient_id.eq." + profile.id + ")",
+      )
+      .order("created_at", { ascending: true })
+      .limit(100);
+
+    if (error) {
+      setStatus(error.message);
+      return;
+    }
+
+    setDmMessages((messages || []) as DirectMessage[]);
+    setDmDraft("");
+  }
+
+  async function sendDirectMessage(event: FormEvent) {
+    event.preventDefault();
+    const trimmed = dmDraft.trim();
+
+    if (!trimmed || sendingDm || !profile?.id || !activeDmProfile) return;
+
+    setSendingDm(true);
+
+    const { data: created, error } = await client
+      .from("direct_messages")
+      .insert({
+        sender_id: profile.id,
+        recipient_id: activeDmProfile.id,
+        body: trimmed,
+      })
+      .select("id,sender_id,recipient_id,body,created_at")
+      .single();
+
+    setSendingDm(false);
+
+    if (error) {
+      setStatus(error.message);
+      return;
+    }
+
+    setDmMessages((current) =>
+      current.some((message) => message.id === created.id)
+        ? current
+        : [...current, created as DirectMessage],
+    );
+    setDmDraft("");
   }
 
   async function post(event: FormEvent) {
@@ -503,6 +626,17 @@ export default function Community() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages.length]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setChatMessages((current) =>
+        current.filter((message) => new Date(message.expires_at).getTime() > now),
+      );
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
   const initials = (profile?.display_name || "?").slice(0, 1).toUpperCase();
   const currentColor = avatarColors.find(([key]) => key === (profile?.avatar_color || avatarColor))?.[1] || "bg-blue-500";
 
@@ -620,7 +754,15 @@ export default function Community() {
                       const mine = message.author_id === profile.id;
 
                       return (
-                        <div key={message.id} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
+                        <div
+                          key={message.id}
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            if (!mine) openDirectMessage(message.author_id);
+                          }}
+                          className={"flex " + (mine ? "justify-end" : "justify-start")}
+                          title={mine ? undefined : "Right-click to message privately"}
+                        >
                           <div className={`max-w-[82%] ${mine ? "items-end" : "items-start"}`}>
                             <div className="mb-1 flex items-center gap-2 px-1">
                               <span className="text-xs font-semibold text-zinc-400">
@@ -642,6 +784,11 @@ export default function Community() {
                             >
                               {message.body}
                             </div>
+                            {!mine ? (
+                              <p className="mt-1 px-1 text-[10px] text-zinc-700">
+                                Right-click to DM
+                              </p>
+                            ) : null}
                           </div>
                         </div>
                       );
@@ -790,6 +937,49 @@ export default function Community() {
             </section>
           </>
         )}
+
+            {activeDmProfile ? (
+              <section className="fixed bottom-4 right-4 z-50 flex w-[min(380px,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border border-white/10 bg-zinc-950 shadow-2xl shadow-black/50">
+                <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-xs font-bold">
+                      {(activeDmProfile.display_name || "T").slice(0, 1).toUpperCase()}
+                    </span>
+                    <div>
+                      <p className="text-sm font-bold">{activeDmProfile.display_name || "Townie"}</p>
+                      <p className="text-[10px] text-zinc-600">Private message</p>
+                    </div>
+                  </div>
+                  <button type="button" onClick={() => setActiveDmProfile(null)} className="rounded-lg px-2 py-1 text-zinc-500 hover:bg-white/5 hover:text-white" aria-label="Close message">×</button>
+                </div>
+                <div className="max-h-72 min-h-28 overflow-y-auto px-3 py-3">
+                  {dmMessages.length === 0 ? (
+                    <div className="flex h-24 items-center justify-center text-center text-xs text-zinc-600">
+                      Start a private conversation with {activeDmProfile.display_name || "this townie"}.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {dmMessages.map((message) => {
+                        const mine = message.sender_id === profile.id;
+                        return (
+                          <div key={message.id} className={"flex " + (mine ? "justify-end" : "justify-start")}>
+                            <div className={"max-w-[82%] rounded-2xl px-3 py-2 text-sm leading-5 " + (mine ? "rounded-br-md bg-white text-black" : "rounded-bl-md bg-white/[.08] text-zinc-200")}>
+                              {message.body}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <form onSubmit={sendDirectMessage} className="border-t border-white/10 p-3">
+                  <div className="flex gap-2">
+                    <input value={dmDraft} onChange={(event) => setDmDraft(event.target.value.slice(0, 2000))} placeholder={"Message " + (activeDmProfile.display_name || "townie") + "…"} maxLength={2000} autoFocus className="min-w-0 flex-1 rounded-xl border border-white/10 bg-black/30 px-3 py-2.5 text-sm outline-none focus:border-white/30" />
+                    <button disabled={sendingDm || !dmDraft.trim()} className="rounded-xl bg-white px-4 py-2.5 text-sm font-bold text-black disabled:opacity-40">{sendingDm ? "…" : "Send"}</button>
+                  </div>
+                </form>
+              </section>
+            ) : null}
       </div>
     </main>
   );
