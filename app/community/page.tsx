@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../../lib/supabase";
 
 type Profile = {
@@ -35,6 +35,14 @@ type Reaction = {
   user_id: string;
 };
 
+type ChatMessage = {
+  id: string;
+  community_id: string;
+  author_id: string;
+  body: string;
+  created_at: string;
+};
+
 const avatarColors = [
   ["slate", "bg-slate-500"],
   ["blue", "bg-blue-500"],
@@ -49,7 +57,11 @@ export default function Community() {
   const [posts, setPosts] = useState<Post[]>([]);
   const [comments, setComments] = useState<Record<string, Comment[]>>({});
   const [reactions, setReactions] = useState<Record<string, Reaction[]>>({});
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState("");
+  const [sendingChat, setSendingChat] = useState(false);
   const [profiles, setProfiles] = useState<Record<string, Profile>>({});
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [zip, setZip] = useState("");
   const [title, setTitle] = useState("");
@@ -67,6 +79,7 @@ export default function Community() {
   useEffect(() => {
     let postChannel: ReturnType<typeof client.channel> | null = null;
     let commentChannel: ReturnType<typeof client.channel> | null = null;
+    let chatChannel: ReturnType<typeof client.channel> | null = null;
 
     async function start() {
       const currentZip = localStorage.getItem("anytown_zip") || "";
@@ -143,9 +156,24 @@ export default function Community() {
       const nextPosts = (loadedPosts || []) as Post[];
       setPosts(nextPosts);
 
-      if (nextPosts.length) {
+      const { data: loadedChat } = await client
+        .from("chat_messages")
+        .select("id,community_id,author_id,body,created_at")
+        .eq("community_id", community.id)
+        .order("created_at", { ascending: true })
+        .limit(100);
+
+      const nextChat = (loadedChat || []) as ChatMessage[];
+      setChatMessages(nextChat);
+
+      if (nextPosts.length || nextChat.length) {
         const ids = nextPosts.map((p) => p.id);
-        const authorIds = [...new Set(nextPosts.map((p) => p.author_id))];
+        const authorIds = [
+          ...new Set([
+            ...nextPosts.map((p) => p.author_id),
+            ...nextChat.map((message) => message.author_id),
+          ]),
+        ];
 
         const [{ data: loadedComments }, { data: loadedReactions }, { data: loadedProfiles }] =
           await Promise.all([
@@ -194,6 +222,42 @@ export default function Community() {
         )
         .subscribe();
 
+      chatChannel = client
+        .channel("live-town-chat")
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "chat_messages",
+            filter: "community_id=eq." + community.id,
+          },
+          async (event) => {
+            const incoming = event.new as ChatMessage;
+            setChatMessages((current) =>
+              current.some((message) => message.id === incoming.id)
+                ? current
+                : [...current, incoming],
+            );
+
+            if (!profiles[incoming.author_id]) {
+              const { data: author } = await client
+                .from("profiles")
+                .select("id,display_name,avatar_color,gender")
+                .eq("id", incoming.author_id)
+                .maybeSingle();
+
+              if (author) {
+                setProfiles((current) => ({
+                  ...current,
+                  [incoming.author_id]: author as Profile,
+                }));
+              }
+            }
+          },
+        )
+        .subscribe();
+
       commentChannel = client
         .channel("live-comments")
         .on(
@@ -215,6 +279,7 @@ export default function Community() {
     return () => {
       if (postChannel) client.removeChannel(postChannel);
       if (commentChannel) client.removeChannel(commentChannel);
+      if (chatChannel) client.removeChannel(chatChannel);
     };
   }, [client]);
 
@@ -260,6 +325,54 @@ export default function Community() {
     setProfile(saved as Profile);
     setProfiles((current) => ({ ...current, [user.id]: saved as Profile }));
     setStatus("You're in.");
+  }
+
+  async function sendChat(event: FormEvent) {
+    event.preventDefault();
+    const trimmed = chatDraft.trim();
+
+    if (!trimmed || sendingChat) return;
+
+    if (!profile?.display_name) {
+      setStatus("Choose your name first.");
+      return;
+    }
+
+    const {
+      data: { user },
+    } = await client.auth.getUser();
+
+    if (!user || !communityId) {
+      setStatus("Your session expired or the town is still loading.");
+      return;
+    }
+
+    setSendingChat(true);
+
+    const { data: created, error } = await client
+      .from("chat_messages")
+      .insert({
+        community_id: communityId,
+        author_id: user.id,
+        body: trimmed,
+      })
+      .select("id,community_id,author_id,body,created_at")
+      .single();
+
+    setSendingChat(false);
+
+    if (error) {
+      setStatus(error.message);
+      return;
+    }
+
+    setChatMessages((current) =>
+      current.some((message) => message.id === created.id)
+        ? current
+        : [...current, created as ChatMessage],
+    );
+    setChatDraft("");
+    setStatus("Live");
   }
 
   async function post(event: FormEvent) {
@@ -386,6 +499,10 @@ export default function Community() {
     }
   }
 
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages.length]);
+
   const initials = (profile?.display_name || "?").slice(0, 1).toUpperCase();
   const currentColor = avatarColors.find(([key]) => key === (profile?.avatar_color || avatarColor))?.[1] || "bg-blue-500";
 
@@ -471,6 +588,90 @@ export default function Community() {
                 </span>
               </div>
             </div>
+
+            <section className="mt-8 overflow-hidden rounded-3xl border border-white/10 bg-white/[.035] shadow-2xl">
+              <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-emerald-400" />
+                    <h2 className="text-lg font-bold">Town Chat</h2>
+                  </div>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    The live conversation for everyone in {zip || "your town"}.
+                  </p>
+                </div>
+                <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-zinc-500">
+                  LIVE
+                </span>
+              </div>
+
+              <div className="h-[360px] overflow-y-auto px-4 py-4">
+                {chatMessages.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-center text-sm text-zinc-600">
+                    <div>
+                      <p className="text-zinc-400">Nobody is talking yet.</p>
+                      <p className="mt-1">Say hello and start the town conversation.</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {chatMessages.map((message) => {
+                      const author = profiles[message.author_id];
+                      const mine = message.author_id === profile.id;
+
+                      return (
+                        <div key={message.id} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
+                          <div className={`max-w-[82%] ${mine ? "items-end" : "items-start"}`}>
+                            <div className="mb-1 flex items-center gap-2 px-1">
+                              <span className="text-xs font-semibold text-zinc-400">
+                                {author?.display_name || "Townie"}
+                              </span>
+                              <time className="text-[10px] text-zinc-700">
+                                {new Date(message.created_at).toLocaleTimeString([], {
+                                  hour: "numeric",
+                                  minute: "2-digit",
+                                })}
+                              </time>
+                            </div>
+                            <div
+                              className={`rounded-2xl px-4 py-2.5 text-sm leading-6 ${
+                                mine
+                                  ? "rounded-br-md bg-white text-black"
+                                  : "rounded-bl-md bg-white/[.07] text-zinc-200"
+                              }`}
+                            >
+                              {message.body}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div ref={chatEndRef} />
+                  </div>
+                )}
+              </div>
+
+              <form onSubmit={sendChat} className="border-t border-white/10 bg-black/20 p-3">
+                <div className="flex gap-2">
+                  <input
+                    value={chatDraft}
+                    onChange={(event) => setChatDraft(event.target.value.slice(0, 1000))}
+                    placeholder="Talk to your town…"
+                    maxLength={1000}
+                    className="min-w-0 flex-1 rounded-xl border border-white/10 bg-black/30 px-4 py-3 text-sm outline-none focus:border-white/30"
+                  />
+                  <button
+                    disabled={sendingChat || !chatDraft.trim()}
+                    className="rounded-xl bg-white px-5 py-3 text-sm font-bold text-black disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {sendingChat ? "Sending…" : "Send"}
+                  </button>
+                </div>
+                <p className="mt-2 px-1 text-[11px] text-zinc-700">
+                  Press Enter to send • Everyone in this town can see the chat
+                </p>
+              </form>
+            </section>
 
             <form onSubmit={post} className="mt-8 rounded-2xl border border-white/10 bg-white/[.04] p-5">
               <div className="flex flex-col gap-3 sm:flex-row">
