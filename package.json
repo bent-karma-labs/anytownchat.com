@@ -17,8 +17,7 @@
     "@capacitor/core": "latest",
     "next": "latest",
     "react": "latest",
-    "react-dom": "latest",
-    "@marsidev/react-turnstile": "latest"
+    "react-dom": "latest"
   },
   "devDependencies": {
     "@capacitor/cli": "latest",
