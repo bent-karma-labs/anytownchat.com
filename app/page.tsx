@@ -81,7 +81,7 @@ export default function Home() {
       <Script
         id="turnstile-script"
         src={TURNSTILE_SCRIPT}
-        strategy="beforeInteractive"
+        strategy="afterInteractive"
       />
 
       <main className="min-h-screen px-6 py-10 md:px-12">
