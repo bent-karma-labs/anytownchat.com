@@ -88,7 +88,11 @@ export default function Community() {
   const [status, setStatus] = useState("Loading…");
   const [communityId, setCommunityId] = useState<string | null>(null);
   const client = useMemo(() => supabase(), []);
-  const activeDmUserId = activeDmProfile?.id || null;
+  const activeDmUserIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    activeDmUserIdRef.current = activeDmProfile?.id || null;
+  }, [activeDmProfile?.id]);
 
   useEffect(() => {
     let postChannel: ReturnType<typeof client.channel> | null = null;
@@ -294,10 +298,10 @@ export default function Community() {
             const incoming = event.new as DirectMessage;
             setDmMessages((current) => {
               if (
-                !activeDmUserId ||
+                !activeDmUserIdRef.current ||
                 !(
-                  (incoming.sender_id === user.id && incoming.recipient_id === activeDmUserId) ||
-                  (incoming.sender_id === activeDmUserId && incoming.recipient_id === user.id)
+                  (incoming.sender_id === user.id && incoming.recipient_id === activeDmUserIdRef.current) ||
+                  (incoming.sender_id === activeDmUserIdRef.current && incoming.recipient_id === user.id)
                 )
               ) {
                 return current;
