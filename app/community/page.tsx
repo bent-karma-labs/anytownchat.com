@@ -522,7 +522,7 @@ export default function Community() {
     }
 
     if (!communityId) {
-      setStatus("Community is still loading.");
+      setStatus("Still connecting to your town…");
       return;
     }
 
@@ -812,10 +812,10 @@ export default function Community() {
                     className="min-w-0 flex-1 rounded-xl border border-white/10 bg-black/30 px-4 py-3 text-sm outline-none focus:border-white/30"
                   />
                   <button
-                    disabled={sendingChat || !chatDraft.trim()}
+                    disabled={!communityId || sendingChat || !chatDraft.trim()}
                     className="rounded-xl bg-white px-5 py-3 text-sm font-bold text-black disabled:cursor-not-allowed disabled:opacity-40"
                   >
-                    {sendingChat ? "Sending…" : "Send"}
+                    {sendingChat ? "Sending…" : communityId ? "Send" : "Connecting…"}
                   </button>
                 </div>
                 <p className="mt-2 px-1 text-[11px] text-zinc-700">
