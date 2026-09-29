@@ -3,6 +3,13 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { supabase } from "../../lib/supabase";
 
+type Profile = {
+  id: string;
+  display_name: string | null;
+  avatar_color: string;
+  gender: string | null;
+};
+
 type Post = {
   id: string;
   title: string | null;
@@ -10,6 +17,7 @@ type Post = {
   category: string;
   created_at: string;
   community_id: string;
+  author_id: string;
 };
 
 type Comment = {
@@ -17,23 +25,41 @@ type Comment = {
   post_id: string;
   body: string;
   created_at: string;
+  author_id: string;
 };
 
 type Reaction = {
   id: string;
   post_id: string;
   kind: string;
+  user_id: string;
 };
+
+const avatarColors = [
+  ["slate", "bg-slate-500"],
+  ["blue", "bg-blue-500"],
+  ["violet", "bg-violet-500"],
+  ["pink", "bg-pink-500"],
+  ["orange", "bg-orange-500"],
+  ["green", "bg-green-500"],
+  ["cyan", "bg-cyan-500"],
+];
 
 export default function Community() {
   const [posts, setPosts] = useState<Post[]>([]);
   const [comments, setComments] = useState<Record<string, Comment[]>>({});
   const [reactions, setReactions] = useState<Record<string, Reaction[]>>({});
+  const [profiles, setProfiles] = useState<Record<string, Profile>>({});
+  const [profile, setProfile] = useState<Profile | null>(null);
   const [zip, setZip] = useState("");
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [category, setCategory] = useState("chat");
   const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
+  const [displayName, setDisplayName] = useState("");
+  const [gender, setGender] = useState("na");
+  const [avatarColor, setAvatarColor] = useState("blue");
+  const [savingProfile, setSavingProfile] = useState(false);
   const [status, setStatus] = useState("Loading…");
   const [communityId, setCommunityId] = useState<string | null>(null);
   const client = useMemo(() => supabase(), []);
@@ -46,14 +72,44 @@ export default function Community() {
       const currentZip = localStorage.getItem("anytown_zip") || "";
       setZip(currentZip);
 
+      const {
+        data: { user },
+      } = await client.auth.getUser();
+
+      if (!user) {
+        setStatus("Your session expired. Go back and enter your town again.");
+        return;
+      }
+
+      const { data: currentProfile, error: profileError } = await client
+        .from("profiles")
+        .select("id,display_name,avatar_color,gender")
+        .eq("id", user.id)
+        .maybeSingle();
+
+      if (profileError) {
+        setStatus(profileError.message);
+        return;
+      }
+
+      if (currentProfile) {
+        const p = currentProfile as Profile;
+        setProfile(p);
+        setDisplayName(p.display_name || "");
+        setGender(p.gender || "na");
+        setAvatarColor(p.avatar_color || "blue");
+      }
+
       if (!currentZip) {
         setStatus("Enter your ZIP first.");
         return;
       }
 
-      const { error: joinError } = await client.rpc("join_or_create_community", {
-        p_zip: currentZip,
-      });
+      const { data: joinedCommunityId, error: joinError } = await client.rpc(
+        "join_or_create_community",
+        { p_zip: currentZip },
+      );
+
       if (joinError) {
         setStatus(joinError.message);
         return;
@@ -62,7 +118,7 @@ export default function Community() {
       const { data: community, error: communityError } = await client
         .from("communities")
         .select("id,name")
-        .eq("zip_code", currentZip)
+        .eq("id", joinedCommunityId)
         .maybeSingle();
 
       if (communityError || !community) {
@@ -74,7 +130,7 @@ export default function Community() {
 
       const { data: loadedPosts, error: postsError } = await client
         .from("posts")
-        .select("id,title,body,category,created_at,community_id")
+        .select("id,title,body,category,created_at,community_id,author_id")
         .eq("community_id", community.id)
         .order("created_at", { ascending: false })
         .limit(50);
@@ -89,20 +145,32 @@ export default function Community() {
 
       if (nextPosts.length) {
         const ids = nextPosts.map((p) => p.id);
-        const [{ data: loadedComments }, { data: loadedReactions }] = await Promise.all([
-          client
-            .from("comments")
-            .select("id,post_id,body,created_at")
-            .in("post_id", ids)
-            .order("created_at", { ascending: true }),
-          client
-            .from("reactions")
-            .select("id,post_id,kind")
-            .in("post_id", ids),
-        ]);
+        const authorIds = [...new Set(nextPosts.map((p) => p.author_id))];
+
+        const [{ data: loadedComments }, { data: loadedReactions }, { data: loadedProfiles }] =
+          await Promise.all([
+            client
+              .from("comments")
+              .select("id,post_id,body,created_at,author_id")
+              .in("post_id", ids)
+              .order("created_at", { ascending: true }),
+            client
+              .from("reactions")
+              .select("id,post_id,kind,user_id")
+              .in("post_id", ids),
+            client
+              .from("profiles")
+              .select("id,display_name,avatar_color,gender")
+              .in("id", authorIds),
+          ]);
 
         setComments(groupByPost((loadedComments || []) as Comment[]));
         setReactions(groupByPost((loadedReactions || []) as Reaction[]));
+        setProfiles(
+          Object.fromEntries(
+            ((loadedProfiles || []) as Profile[]).map((p) => [p.id, p]),
+          ),
+        );
       }
 
       setStatus(community.name || "Your community");
@@ -150,17 +218,66 @@ export default function Community() {
     };
   }, [client]);
 
-  async function post(event: FormEvent) {
+  async function saveProfile(event: FormEvent) {
     event.preventDefault();
-    const trimmedBody = body.trim();
-    if (!trimmedBody) return;
+    const name = displayName.trim();
+
+    if (name.length < 2 || name.length > 30) {
+      setStatus("Pick a name between 2 and 30 characters.");
+      return;
+    }
+
+    setSavingProfile(true);
 
     const {
       data: { user },
     } = await client.auth.getUser();
 
     if (!user) {
-      setStatus("Sign in first.");
+      setSavingProfile(false);
+      setStatus("Your session expired. Go back and enter your town again.");
+      return;
+    }
+
+    const { data: saved, error } = await client
+      .from("profiles")
+      .update({
+        display_name: name,
+        gender,
+        avatar_color: avatarColor,
+      })
+      .eq("id", user.id)
+      .select("id,display_name,avatar_color,gender")
+      .single();
+
+    setSavingProfile(false);
+
+    if (error) {
+      setStatus(error.message);
+      return;
+    }
+
+    setProfile(saved as Profile);
+    setProfiles((current) => ({ ...current, [user.id]: saved as Profile }));
+    setStatus("You're in.");
+  }
+
+  async function post(event: FormEvent) {
+    event.preventDefault();
+    const trimmedBody = body.trim();
+    if (!trimmedBody) return;
+
+    if (!profile?.display_name) {
+      setStatus("Choose your name first.");
+      return;
+    }
+
+    const {
+      data: { user },
+    } = await client.auth.getUser();
+
+    if (!user) {
+      setStatus("Your session expired. Go back and enter your town again.");
       return;
     }
 
@@ -169,19 +286,24 @@ export default function Community() {
       return;
     }
 
-    const { error } = await client.from("posts").insert({
-      community_id: communityId,
-      author_id: user.id,
-      title: title.trim() || null,
-      body: trimmedBody,
-      category,
-    });
+    const { data: created, error } = await client
+      .from("posts")
+      .insert({
+        community_id: communityId,
+        author_id: user.id,
+        title: title.trim() || null,
+        body: trimmedBody,
+        category,
+      })
+      .select("id,title,body,category,created_at,community_id,author_id")
+      .single();
 
     if (error) {
       setStatus(error.message);
       return;
     }
 
+    setPosts((current) => [created as Post, ...current]);
     setTitle("");
     setBody("");
     setStatus("Posted.");
@@ -196,21 +318,29 @@ export default function Community() {
     } = await client.auth.getUser();
 
     if (!user) {
-      setStatus("Sign in first.");
+      setStatus("Your session expired.");
       return;
     }
 
-    const { error } = await client.from("comments").insert({
-      post_id: postId,
-      author_id: user.id,
-      body: draft,
-    });
+    const { data: created, error } = await client
+      .from("comments")
+      .insert({
+        post_id: postId,
+        author_id: user.id,
+        body: draft,
+      })
+      .select("id,post_id,body,created_at,author_id")
+      .single();
 
     if (error) {
       setStatus(error.message);
       return;
     }
 
+    setComments((current) => ({
+      ...current,
+      [postId]: [...(current[postId] || []), created as Comment],
+    }));
     setCommentDrafts((current) => ({ ...current, [postId]: "" }));
   }
 
@@ -219,10 +349,7 @@ export default function Community() {
       data: { user },
     } = await client.auth.getUser();
 
-    if (!user) {
-      setStatus("Sign in first.");
-      return;
-    }
+    if (!user) return;
 
     const { data: existing } = await client
       .from("reactions")
@@ -235,154 +362,233 @@ export default function Community() {
     if (existing) {
       const { error } = await client.from("reactions").delete().eq("id", existing.id);
       if (error) setStatus(error.message);
+      else {
+        setReactions((current) => ({
+          ...current,
+          [postId]: (current[postId] || []).filter((r) => r.id !== existing.id),
+        }));
+      }
       return;
     }
 
-    const { error } = await client.from("reactions").insert({
-      post_id: postId,
-      user_id: user.id,
-      kind: "like",
-    });
+    const { data: created, error } = await client
+      .from("reactions")
+      .insert({ post_id: postId, user_id: user.id, kind: "like" })
+      .select("id,post_id,kind,user_id")
+      .single();
 
     if (error) setStatus(error.message);
+    else {
+      setReactions((current) => ({
+        ...current,
+        [postId]: [...(current[postId] || []), created as Reaction],
+      }));
+    }
   }
+
+  const initials = (profile?.display_name || "?").slice(0, 1).toUpperCase();
+  const currentColor = avatarColors.find(([key]) => key === (profile?.avatar_color || avatarColor))?.[1] || "bg-blue-500";
 
   return (
     <main className="min-h-screen px-5 py-8">
       <div className="mx-auto max-w-4xl">
         <header className="flex items-center justify-between">
-          <a href="/" className="font-bold">
-            Anytown Chat
-          </a>
+          <a href="/" className="font-bold">Anytown Chat</a>
           <span className="text-sm text-zinc-500">{status}</span>
         </header>
 
-        <div className="mt-10 flex items-end justify-between gap-4">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[.2em] text-zinc-500">
-              LIVE LOCAL
-            </p>
-            <h1 className="mt-2 text-4xl font-black">{zip || "Community"}</h1>
-          </div>
-          <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-zinc-500">
-            ZIP community
-          </span>
-        </div>
-
-        <form
-          onSubmit={post}
-          className="mt-8 rounded-2xl border border-white/10 bg-white/[.04] p-5"
-        >
-          <div className="flex flex-col gap-3 sm:flex-row">
-            <select
-              value={category}
-              onChange={(event) => setCategory(event.target.value)}
-              className="rounded-lg bg-black px-3 py-2"
-            >
-              <option value="chat">Chat</option>
-              <option value="news">News</option>
-              <option value="event">Event</option>
-              <option value="help">Help</option>
-              <option value="buy_sell">Buy / Sell</option>
-              <option value="business">Business</option>
-            </select>
-            <input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="What’s happening?"
-              className="flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2"
-            />
-          </div>
-          <textarea
-            value={body}
-            onChange={(event) => setBody(event.target.value)}
-            required
-            placeholder="Say something your town should know…"
-            className="mt-3 min-h-28 w-full rounded-lg border border-white/10 bg-black/30 p-3"
-          />
-          <button className="mt-3 rounded-lg bg-white px-5 py-2 font-bold text-black">
-            Post
-          </button>
-        </form>
-
-        <section className="mt-8 space-y-4">
-          {posts.length === 0 && communityId ? (
-            <div className="rounded-2xl border border-dashed border-white/10 p-8 text-center text-zinc-500">
-              Your town is quiet. Start the first conversation.
+        {!profile?.display_name ? (
+          <section className="mx-auto mt-16 max-w-lg rounded-3xl border border-white/10 bg-white/[.04] p-7">
+            <div className="mb-6">
+              <p className="text-xs font-semibold uppercase tracking-[.2em] text-zinc-500">WELCOME TO ANYTOWN</p>
+              <h1 className="mt-2 text-3xl font-black">What should people call you?</h1>
+              <p className="mt-2 text-sm leading-6 text-zinc-500">
+                Pick a display name and a little avatar style. You can change these later.
+              </p>
             </div>
-          ) : null}
 
-          {posts.map((post) => {
-            const postComments = comments[post.id] || [];
-            const postReactions = reactions[post.id] || [];
+            <form onSubmit={saveProfile}>
+              <label className="block text-sm text-zinc-400">
+                Display name
+                <input
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value.slice(0, 30))}
+                  placeholder="Townie"
+                  autoFocus
+                  className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-4 py-3 outline-none focus:border-white/30"
+                />
+              </label>
 
-            return (
-              <article key={post.id} className="rounded-2xl border border-white/10 p-5">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-xs uppercase tracking-wide text-zinc-500">
-                    {post.category.replace("_", " ")}
-                  </span>
-                  <time className="text-xs text-zinc-600">
-                    {new Date(post.created_at).toLocaleString()}
-                  </time>
+              <label className="mt-5 block text-sm text-zinc-400">
+                Gender
+                <select
+                  value={gender}
+                  onChange={(event) => setGender(event.target.value)}
+                  className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-4 py-3"
+                >
+                  <option value="male">Male</option>
+                  <option value="female">Female</option>
+                  <option value="na">N/A</option>
+                </select>
+              </label>
+
+              <div className="mt-5">
+                <p className="text-sm text-zinc-400">Avatar color</p>
+                <div className="mt-3 flex flex-wrap gap-3">
+                  {avatarColors.map(([key, color]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      aria-label={key}
+                      onClick={() => setAvatarColor(key)}
+                      className={`h-10 w-10 rounded-full ${color} ${avatarColor === key ? "ring-2 ring-white ring-offset-2 ring-offset-black" : ""}`}
+                    />
+                  ))}
                 </div>
+              </div>
 
-                {post.title ? <h2 className="mt-2 text-xl font-bold">{post.title}</h2> : null}
-                <p className="mt-2 whitespace-pre-wrap text-zinc-300">{post.body}</p>
+              <button
+                disabled={savingProfile}
+                className="mt-7 w-full rounded-xl bg-white px-4 py-3 font-bold text-black disabled:opacity-50"
+              >
+                {savingProfile ? "Saving…" : "Enter the town →"}
+              </button>
+            </form>
+          </section>
+        ) : (
+          <>
+            <div className="mt-10 flex items-end justify-between gap-4">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[.2em] text-zinc-500">LIVE LOCAL</p>
+                <h1 className="mt-2 text-4xl font-black">{zip || "Community"}</h1>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className={`flex h-9 w-9 items-center justify-center rounded-full text-sm font-bold text-white ${currentColor}`}>
+                  {initials}
+                </span>
+                <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-zinc-500">
+                  {profile.display_name}
+                </span>
+              </div>
+            </div>
 
-                <div className="mt-5 flex items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => react(post.id)}
-                    className="rounded-full border border-white/10 px-3 py-1 text-sm hover:bg-white/5"
-                  >
-                    👍 {postReactions.length}
-                  </button>
-                  <span className="text-sm text-zinc-600">
-                    {postComments.length} {postComments.length === 1 ? "comment" : "comments"}
-                  </span>
+            <form onSubmit={post} className="mt-8 rounded-2xl border border-white/10 bg-white/[.04] p-5">
+              <div className="flex flex-col gap-3 sm:flex-row">
+                <select
+                  value={category}
+                  onChange={(event) => setCategory(event.target.value)}
+                  className="rounded-lg bg-black px-3 py-2"
+                >
+                  <option value="chat">Chat</option>
+                  <option value="news">News</option>
+                  <option value="event">Event</option>
+                  <option value="help">Help</option>
+                  <option value="buy_sell">Buy / Sell</option>
+                  <option value="business">Business</option>
+                </select>
+                <input
+                  value={title}
+                  onChange={(event) => setTitle(event.target.value)}
+                  placeholder="What’s happening?"
+                  className="flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2"
+                />
+              </div>
+              <textarea
+                value={body}
+                onChange={(event) => setBody(event.target.value)}
+                required
+                placeholder="Say something your town should know…"
+                className="mt-3 min-h-28 w-full rounded-lg border border-white/10 bg-black/30 p-3"
+              />
+              <button className="mt-3 rounded-lg bg-white px-5 py-2 font-bold text-black">Post</button>
+            </form>
+
+            <section className="mt-8 space-y-4">
+              {posts.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-white/10 p-8 text-center text-zinc-500">
+                  Your town is quiet. Start the first conversation.
                 </div>
+              ) : null}
 
-                {postComments.length ? (
-                  <div className="mt-4 space-y-2 border-l border-white/10 pl-4">
-                    {postComments.slice(-5).map((comment) => (
-                      <div key={comment.id} className="text-sm text-zinc-400">
-                        {comment.body}
+              {posts.map((post) => {
+                const postComments = comments[post.id] || [];
+                const postReactions = reactions[post.id] || [];
+                const author = profiles[post.author_id];
+
+                return (
+                  <article key={post.id} className="rounded-2xl border border-white/10 p-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-xs font-bold">
+                          {(author?.display_name || "T").slice(0, 1).toUpperCase()}
+                        </span>
+                        <span className="text-sm font-semibold">{author?.display_name || "Townie"}</span>
+                        <span className="text-xs uppercase tracking-wide text-zinc-600">
+                          {post.category.replace("_", " ")}
+                        </span>
                       </div>
-                    ))}
-                  </div>
-                ) : null}
+                      <time className="text-xs text-zinc-600">{new Date(post.created_at).toLocaleString()}</time>
+                    </div>
 
-                <div className="mt-4 flex gap-2">
-                  <input
-                    value={commentDrafts[post.id] || ""}
-                    onChange={(event) =>
-                      setCommentDrafts((current) => ({
-                        ...current,
-                        [post.id]: event.target.value,
-                      }))
-                    }
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && !event.shiftKey) {
-                        event.preventDefault();
-                        addComment(post.id);
-                      }
-                    }}
-                    placeholder="Reply to your town…"
-                    className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => addComment(post.id)}
-                    className="rounded-lg border border-white/10 px-3 py-2 text-sm font-semibold hover:bg-white/5"
-                  >
-                    Reply
-                  </button>
-                </div>
-              </article>
-            );
-          })}
-        </section>
+                    {post.title ? <h2 className="mt-3 text-xl font-bold">{post.title}</h2> : null}
+                    <p className="mt-2 whitespace-pre-wrap text-zinc-300">{post.body}</p>
+
+                    <div className="mt-5 flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => react(post.id)}
+                        className="rounded-full border border-white/10 px-3 py-1 text-sm hover:bg-white/5"
+                      >
+                        👍 {postReactions.length}
+                      </button>
+                      <span className="text-sm text-zinc-600">
+                        {postComments.length} {postComments.length === 1 ? "comment" : "comments"}
+                      </span>
+                    </div>
+
+                    {postComments.length ? (
+                      <div className="mt-4 space-y-2 border-l border-white/10 pl-4">
+                        {postComments.slice(-5).map((comment) => {
+                          const commentAuthor = profiles[comment.author_id];
+                          return (
+                            <div key={comment.id} className="text-sm text-zinc-400">
+                              <span className="font-semibold text-zinc-300">{commentAuthor?.display_name || "Townie"}:</span>{" "}
+                              {comment.body}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+
+                    <div className="mt-4 flex gap-2">
+                      <input
+                        value={commentDrafts[post.id] || ""}
+                        onChange={(event) =>
+                          setCommentDrafts((current) => ({ ...current, [post.id]: event.target.value }))
+                        }
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" && !event.shiftKey) {
+                            event.preventDefault();
+                            addComment(post.id);
+                          }
+                        }}
+                        placeholder="Reply to your town…"
+                        className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => addComment(post.id)}
+                        className="rounded-lg border border-white/10 px-3 py-2 text-sm font-semibold hover:bg-white/5"
+                      >
+                        Reply
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </section>
+          </>
+        )}
       </div>
     </main>
   );
