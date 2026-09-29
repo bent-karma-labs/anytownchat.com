@@ -13,7 +13,9 @@ export default function Home() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const siteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
+  // Turnstile sitekeys are public by design. Keeping this one in the client
+  // guarantees production uses the same widget configured in Cloudflare.
+  const siteKey = "0x4AAAAAAFIp3tChT24nFwzZ";
 
   async function join(event: FormEvent) {
     event.preventDefault();
@@ -115,7 +117,7 @@ export default function Home() {
                   onExpire={() => setCaptchaToken("")}
                   onError={() => {
                     setCaptchaToken("");
-                    setError("Human verification failed. Try again.");
+                    setError("Cloudflare human verification could not load. Check that this domain is authorized in the Turnstile widget.");
                   }}
                 />
               ) : (
