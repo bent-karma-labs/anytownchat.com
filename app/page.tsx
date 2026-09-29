@@ -106,6 +106,11 @@ export default function Home() {
                 <Turnstile
                   ref={captcha}
                   siteKey={siteKey}
+                  options={{
+                    appearance: "always",
+                    size: "flexible",
+                    theme: "dark",
+                  }}
                   onSuccess={setCaptchaToken}
                   onExpire={() => setCaptchaToken("")}
                   onError={() => {
