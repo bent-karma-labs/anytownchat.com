@@ -115,7 +115,7 @@ export default function Community() {
             event: "INSERT",
             schema: "public",
             table: "posts",
-            filter: `community_id=eq.${community.id}`,
+            filter: "community_id=eq." + community.id,
           },
           (event) => {
             const incoming = event.new as Post;
